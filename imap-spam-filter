@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# imap-spam-filter - manage IMAP spam filter accounts running as systemd user services.
+#
+# Passwords are encrypted with `systemd-creds --user` (TPM2-bound, scoped to
+# this user) and only ever decrypted by systemd into the service's private
+# credentials directory, or into a pipe for `run`. They are never stored in
+# plain text, put on a command line, or exported in the environment.
+set -euo pipefail
+umask 077
+
+APP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/imap-spam-filter"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/imap-spam-filter"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/imap-spam-filter"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+ACCT_DIR="$CONF_DIR/accounts"
+CRED_DIR="$CONF_DIR/creds"
+SCRIPT="$APP_DIR/spam_filter.py"
+
+if [[ -t 1 ]]; then B=$'\e[1m' D=$'\e[2m' R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' C=$'\e[36m' N=$'\e[0m'
+else B= D= R= G= Y= C= N=; fi
+die()  { echo "${R}error:${N} $*" >&2; exit 1; }
+info() { echo "${C}::${N} $*"; }
+
+usage() {
+  cat <<EOF
+${B}imap-spam-filter${N} - IMAP spam filter accounts as systemd user services
+
+${B}Accounts${N}
+  add <name>             add an account (prompts for server, login, password)
+  passwd <name>          change the stored password
+  edit <name>            edit the account settings in \$EDITOR
+  remove <name> [--purge] remove an account (--purge also deletes its learned data)
+  list                   accounts, timers, last result
+
+${B}Run / inspect${N}
+  run <name> <args...>   run spam_filter.py for an account, e.g. ${D}run work classify --limit 10${N}
+  classify <name> [args] run a dry classify now (same as: run <name> classify ...)
+  learn <name>           rebuild the spam profile now (in the background, via systemd)
+  approve <name> [args]  manage the approved list, e.g. ${D}approve work 679dd9${N}
+  logs <name> [-f]       service logs (journalctl)
+  pause|resume <name>    stop or start the timers for an account
+
+${B}Files${N}
+  settings   $ACCT_DIR/<name>.conf
+  password   $CRED_DIR/<name>.cred  (encrypted)
+  data       $STATE_DIR/<name>/
+EOF
+}
+
+valid_name() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$ ]] || die "account name must be letters, digits, - or _ (got '${1:-}')"
+}
+need_acct() {
+  valid_name "$1"
+  [[ -f "$ACCT_DIR/$1.conf" ]] || die "no account '$1' (see: imap-spam-filter list)"
+}
+need_install() {
+  [[ -f "$SCRIPT" && -f "$CONF_DIR/service.env" ]] || die "not installed - run ./install.sh first"
+}
+
+# Values are written as KEY="value", which both bash and systemd's EnvironmentFile read.
+safe_value() {
+  [[ "$1" != *[\"\$\`\\]* && "$1" != *$'\n'* ]] || die "value may not contain quotes, \$, backticks, backslashes or newlines: $1"
+}
+
+ask() {  # ask VAR "Prompt" "default"
+  local reply
+  read -rp "  $2${3:+ ${D}[$3]${N}}: " reply
+  reply="${reply:-${3:-}}"
+  safe_value "$reply"
+  printf -v "$1" '%s' "$reply"
+}
+
+guess_host() {
+  case "${1##*@}" in
+    gmail.com|googlemail.com)                 echo imap.gmail.com ;;
+    outlook.com|hotmail.com|live.com|msn.com) echo outlook.office365.com ;;
+    icloud.com|me.com|mac.com)                echo imap.mail.me.com ;;
+    yahoo.com)                                echo imap.mail.yahoo.com ;;
+    fastmail.com|fastmail.fm)                 echo imap.fastmail.com ;;
+    *@*|"")                                   echo "" ;;
+    *)                                        echo "imap.${1##*@}" ;;
+  esac
+}
+
+# Reads the password from stdin, so it never appears in argv or the environment.
+test_login() {  # test_login host port user  < password
+  "$PYTHON" -c '
+import imaplib, sys
+try:
+    c = imaplib.IMAP4_SSL(sys.argv[1], int(sys.argv[2]), timeout=20)
+    c.login(sys.argv[3], sys.stdin.read())
+    c.logout()
+except Exception as e:
+    sys.exit(f"{type(e).__name__}: {e}")
+' "$1" "$2" "$3"
+}
+
+# Prompts until the login works, then writes the encrypted credential.
+store_password() {  # store_password name host port user
+  local name=$1 host=$2 port=$3 user=$4 pw tries=0
+  local cred="$CRED_DIR/$name.cred"
+  while :; do
+    read -rsp "  IMAP password / app password for $user: " pw; echo
+    [[ -n "$pw" ]] || continue
+    echo -n "  ${D}testing login to $host:$port ...${N} "
+    if err=$(printf '%s' "$pw" | test_login "$host" "$port" "$user" 2>&1); then
+      echo "${G}ok${N}"; break
+    fi
+    echo "${R}failed${N}"; echo "  ${D}$err${N}"
+    (( ++tries >= 3 )) && { pw=; die "login failed 3 times"; }
+  done
+  umask 077
+  printf '%s' "$pw" | systemd-creds encrypt --user --name=imap-password - "$cred.tmp" \
+    || { pw=; rm -f "$cred.tmp"; die "systemd-creds encrypt failed"; }
+  pw=
+  mv -f "$cred.tmp" "$cred"
+  chmod 600 "$cred"
+  info "password encrypted -> $cred"
+}
+
+load_acct() {  # exports the account settings into this shell
+  set -a
+  # shellcheck disable=SC1090
+  . "$CONF_DIR/service.env"; . "$ACCT_DIR/$1.conf"
+  set +a
+  export SPAM_FILTER_DATA_DIR="$STATE_DIR/$1"
+  export SPAM_FILTER_APPROVE_CMD="imap-spam-filter approve $1"
+  mkdir -p -m 700 "$SPAM_FILTER_DATA_DIR"
+}
+
+set_interval() {  # set_interval name interval
+  local dropin="$UNIT_DIR/imap-spam-filter@$1.timer.d"
+  if [[ "$2" == "15min" ]]; then
+    rm -rf "$dropin"
+  else
+    mkdir -p "$dropin"
+    printf '[Timer]\nOnUnitInactiveSec=\nOnUnitInactiveSec=%s\n' "$2" > "$dropin/interval.conf"
+  fi
+}
+
+# --------------------------------------------------------------------------- commands
+
+cmd_add() {
+  local name=${1:-}; valid_name "$name"; need_install
+  [[ -f "$ACCT_DIR/$name.conf" ]] && die "account '$name' exists (use edit / passwd, or remove it first)"
+  [[ -t 0 ]] || die "add is interactive - run it in a terminal"
+
+  echo "${B}New account: $name${N}"
+  local user host port folder args interval
+  ask user     "Email / IMAP username" ""
+  [[ -n "$user" ]] || die "username required"
+  ask host     "IMAP server"           "$(guess_host "$user")"
+  [[ -n "$host" ]] || die "IMAP server required"
+  ask port     "Port (SSL)"            "993"
+  [[ "$port" =~ ^[0-9]+$ ]] || die "port must be a number"
+  ask folder   "Folder to move spam into (created if missing)" "AI-Spam"
+  ask args     "classify options"      "--limit 30 --move --create-folder --min-confidence 0.8"
+  ask interval "Check every (systemd time span)" "15min"
+  systemd-analyze timespan "$interval" >/dev/null 2>&1 || die "invalid time span: $interval"
+  [[ "$host" == imap.gmail.com ]] && echo "  ${Y}Gmail needs an App Password: https://myaccount.google.com/apppasswords${N}"
+
+  store_password "$name" "$host" "$port" "$user"
+
+  umask 077
+  cat > "$ACCT_DIR/$name.conf" <<EOF
+# imap-spam-filter account '$name' - restart not needed, read on every run
+IMAP_HOST="$host"
+IMAP_PORT="$port"
+IMAP_USER="$user"
+# Folder spam is moved into; also learned from together with the server's Spam folder
+SPAM_FOLDER="$folder"
+# Options for each scheduled run (see: spam_filter.py classify --help)
+CLASSIFY_ARGS="$args"
+# Options for the weekly learn run (see: spam_filter.py learn --help)
+LEARN_ARGS="--learn-limit 1000"
+EOF
+  mkdir -p -m 700 "$STATE_DIR/$name"
+
+  # Offer to carry over data from a manual setup (profile, approved list, cache).
+  local src
+  src="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+  for src in "$src" "$HOME/Work/imap-spam-filter"; do
+    if [[ -f "$src/approved.json" || -f "$src/spam_profile.json" ]]; then
+      local yn; read -rp "  Copy existing profile/approved list from $src? [y/N] " yn
+      if [[ "$yn" == [yY]* ]]; then
+        for f in spam_profile.json approved.json classified.json; do
+          [[ -f "$src/$f" ]] && install -m 600 "$src/$f" "$STATE_DIR/$name/$f"
+        done
+        info "copied data from $src"
+      fi
+      break
+    fi
+  done
+
+  set_interval "$name" "$interval"
+  systemctl --user daemon-reload
+  systemctl --user enable --now "imap-spam-filter@$name.timer" "imap-spam-filter-learn@$name.timer" >/dev/null
+  if [[ ! -f "$STATE_DIR/$name/spam_profile.json" ]]; then
+    systemctl --user start --no-block "imap-spam-filter-learn@$name.service"
+    info "learning from spam folders in the background (imap-spam-filter logs $name -f)"
+  fi
+  echo
+  info "${G}account '$name' active${N} - checks every $interval, learns weekly"
+  echo "   try a dry run now:  ${B}imap-spam-filter classify $name --limit 10${N}"
+}
+
+cmd_passwd() {
+  local name=${1:-}; need_acct "$name"; need_install
+  load_acct "$name"
+  store_password "$name" "$IMAP_HOST" "$IMAP_PORT" "$IMAP_USER"
+}
+
+cmd_edit() {
+  local name=${1:-}; need_acct "$name"
+  "${EDITOR:-nano}" "$ACCT_DIR/$name.conf"
+}
+
+cmd_remove() {
+  local name=${1:-} purge=${2:-}; need_acct "$name"
+  local yn; read -rp "Remove account '$name'? [y/N] " yn
+  [[ "$yn" == [yY]* ]] || exit 0
+  systemctl --user disable --now "imap-spam-filter@$name.timer" "imap-spam-filter-learn@$name.timer" 2>/dev/null || true
+  rm -f "$ACCT_DIR/$name.conf" "$CRED_DIR/$name.cred"
+  rm -rf "$UNIT_DIR/imap-spam-filter@$name.timer.d"
+  [[ "$purge" == --purge ]] && rm -rf "${STATE_DIR:?}/$name"
+  systemctl --user daemon-reload
+  info "removed '$name'${purge:+ and its data}"
+  [[ "$purge" == --purge ]] || echo "   ${D}learned data kept in $STATE_DIR/$name${N}"
+}
+
+cmd_list() {
+  shopt -s nullglob
+  local confs=("$ACCT_DIR"/*.conf)
+  (( ${#confs[@]} )) || { echo "No accounts. Add one: imap-spam-filter add <name>"; return; }
+  printf "${B}%-14s %-32s %-16s %-9s %-22s %s${N}\n" ACCOUNT USER FOLDER TIMER "NEXT CHECK" "LAST RUN"
+  local f name user folder state next result
+  for f in "${confs[@]}"; do
+    name=$(basename "$f" .conf)
+    user=$(sed -n 's/^IMAP_USER="\(.*\)"/\1/p' "$f")
+    folder=$(sed -n 's/^SPAM_FOLDER="\(.*\)"/\1/p' "$f")
+    state=$(systemctl --user is-active "imap-spam-filter@$name.timer" 2>/dev/null || true)
+    next=$(systemctl --user show "imap-spam-filter@$name.timer" -p NextElapseUSecRealtime --value 2>/dev/null)
+    result=$(systemctl --user show "imap-spam-filter@$name.service" -p Result --value 2>/dev/null)
+    [[ "$(systemctl --user show "imap-spam-filter@$name.service" -p ExecMainStartTimestampMonotonic --value)" == 0 ]] && result="never"
+    [[ "$result" == success ]] && result="${G}ok${N}" || { [[ "$result" == never ]] || result="${R}$result${N}"; }
+    [[ "$state" == active ]] && state="${G}active${N}   " || state="${Y}paused${N}   "
+    printf "%-14s %-32s %-16s %s %-22s %s\n" "$name" "${user:0:32}" "${folder:-(server Spam)}" "$state" "${next:--}" "$result"
+  done
+}
+
+cmd_run() {
+  local name=${1:-}; need_acct "$name"; need_install; shift
+  (( $# )) || die "usage: imap-spam-filter run <name> <learn|classify|approve> [options]"
+  load_acct "$name"
+  if [[ "$1" == approve ]]; then  # no IMAP login needed
+    exec "$PYTHON" "$SCRIPT" "$@"
+  fi
+  # Password goes through a pipe (/dev/fd/N), never into the environment.
+  # The lock stops a manual run from overlapping the scheduled one.
+  exec 9<> "$SPAM_FILTER_DATA_DIR/.lock"
+  flock -n 9 || { echo "${D}waiting for the scheduled run of '$name' to finish ...${N}" >&2; flock 9; }
+  IMAP_PASSWORD_FILE=<(systemd-creds decrypt --user --name=imap-password "$CRED_DIR/$name.cred" -) \
+    "$PYTHON" "$SCRIPT" "$@"
+}
+
+cmd_learn() {
+  local name=${1:-}; need_acct "$name"
+  systemctl --user start --no-block "imap-spam-filter-learn@$name.service"
+  info "learning started - follow with: imap-spam-filter logs $name -f"
+}
+
+cmd_logs() {
+  local name=${1:-}; need_acct "$name"; shift
+  journalctl --user -u "imap-spam-filter@$name.service" -u "imap-spam-filter-learn@$name.service" \
+    -n 200 --no-hostname -o short-iso "$@"
+}
+
+cmd_pause()  { need_acct "${1:-}"; systemctl --user disable --now "imap-spam-filter@$1.timer" "imap-spam-filter-learn@$1.timer"; info "paused '$1'"; }
+cmd_resume() { need_acct "${1:-}"; systemctl --user enable  --now "imap-spam-filter@$1.timer" "imap-spam-filter-learn@$1.timer"; info "resumed '$1'"; }
+
+# --------------------------------------------------------------------------- main
+
+[[ -f "$CONF_DIR/service.env" ]] && PYTHON=$(sed -n 's/^PYTHON="\(.*\)"/\1/p' "$CONF_DIR/service.env")
+PYTHON=${PYTHON:-python3}
+
+cmd=${1:-help}; shift || true
+case "$cmd" in
+  add)       cmd_add "$@" ;;
+  passwd)    cmd_passwd "$@" ;;
+  edit)      cmd_edit "$@" ;;
+  remove|rm) cmd_remove "$@" ;;
+  list|ls)   cmd_list ;;
+  run)       cmd_run "$@" ;;
+  classify)  n=${1:-}; shift || true; cmd_run "$n" classify "$@" ;;
+  approve)   n=${1:-}; shift || true; cmd_run "$n" approve "$@" ;;
+  learn)     cmd_learn "$@" ;;
+  logs)      cmd_logs "$@" ;;
+  pause)     cmd_pause "$@" ;;
+  resume)    cmd_resume "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

@@ -1,0 +1,14 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local email classification cache, learned profiles, and approved lists
+classified.json
+spam_profile.json
+approved.json
+*.lock
+
+# Environment and credentials
+*.env
+*.cred
