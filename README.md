@@ -263,6 +263,7 @@ existing `spam_profile.json` / `approved.json` / `classified.json` from this fol
 
 ```bash
 imap-spam-filter list                         # accounts, timer state, next check, last result
+imap-spam-filter gui                          # open the 3-column email triage GUI
 imap-spam-filter logs work -f                 # follow that account's log
 imap-spam-filter classify work --limit 10     # manual dry run (colors, Refs)
 imap-spam-filter approve work 679dd9          # approve a false positive (Ref from logs/output)

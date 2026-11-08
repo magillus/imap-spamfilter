@@ -39,6 +39,7 @@ ${B}Run / inspect${N}
   approve <name> [args]  manage the approved list, e.g. ${D}approve work 679dd9${N}
   logs <name> [-f]       service logs (journalctl)
   pause|resume <name>    stop or start the timers for an account
+  gui                    open the Flutter email triage GUI
 
 ${B}Files${N}
   settings   $ACCT_DIR/<name>.conf
@@ -278,6 +279,16 @@ cmd_logs() {
 
 cmd_pause()  { need_acct "${1:-}"; systemctl --user disable --now "imap-spam-filter@$1.timer" "imap-spam-filter-learn@$1.timer"; info "paused '$1'"; }
 cmd_resume() { need_acct "${1:-}"; systemctl --user enable  --now "imap-spam-filter@$1.timer" "imap-spam-filter-learn@$1.timer"; info "resumed '$1'"; }
+cmd_gui() {
+  local here; here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+  if [[ -x "$here/run-gui.sh" ]]; then
+    exec "$here/run-gui.sh" "$@"
+  elif [[ -x "$APP_DIR/run-gui.sh" ]]; then
+    exec "$APP_DIR/run-gui.sh" "$@"
+  else
+    die "GUI launcher not found in $here or $APP_DIR"
+  fi
+}
 
 # --------------------------------------------------------------------------- main
 
@@ -298,6 +309,7 @@ case "$cmd" in
   logs)      cmd_logs "$@" ;;
   pause)     cmd_pause "$@" ;;
   resume)    cmd_resume "$@" ;;
+  gui)       cmd_gui "$@" ;;
   help|-h|--help) usage ;;
   *) usage; exit 1 ;;
 esac

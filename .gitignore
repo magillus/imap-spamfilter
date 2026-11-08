@@ -12,3 +12,10 @@ approved.json
 # Environment and credentials
 *.env
 *.cred
+
+# Flutter build artifacts
+email_client/build/
+email_client/.dart_tool/
+email_client/.idea/
+email_client/*.iml
+
